@@ -42,6 +42,13 @@ pub fn cancel_menu() -> InlineKeyboardMarkup {
     )]])
 }
 
+/// An empty keyboard. Editing a message with this removes any inline buttons —
+/// used once a job passes the point of no return (finalizing / uploading / done),
+/// so a now-dead Cancel button isn't left dangling.
+pub fn no_menu() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(Vec::<Vec<InlineKeyboardButton>>::new())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

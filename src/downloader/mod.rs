@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::bot::menu::FormatChoice;
 use crate::error::BotError;
-use progress::ProgressState;
+use progress::{Phase, ProgressEvent, PROGRESS_TEMPLATE};
 
 pub use metadata::{fetch as fetch_metadata, VideoMeta};
 
@@ -46,10 +46,14 @@ pub fn build_args(url: &str, choice: FormatChoice, work_dir: &Path) -> Vec<Strin
         "--restrict-filenames".into(),
         "-o".into(),
         out_tmpl,
+        // `--progress` forces progress output even if some flag implies --quiet.
+        // NOTE: we intentionally do NOT use `--print` here: `--print` implies
+        // `--quiet`, which silently suppresses the progress template entirely
+        // (the long-standing reason the bar never moved). We recover the output
+        // path via `resolve_output` (largest media file in the per-job dir).
+        "--progress".into(),
         "--progress-template".into(),
-        "download:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s".into(),
-        "--print".into(),
-        "after_move:filepath".into(),
+        PROGRESS_TEMPLATE.into(),
     ];
 
     match choice {
@@ -75,6 +79,27 @@ pub fn build_args(url: &str, choice: FormatChoice, work_dir: &Path) -> Vec<Strin
     args
 }
 
+/// Map a yt-dlp post-processing banner (printed on stdout) to a UI [`Phase`].
+/// Returns `None` for lines that aren't a stage marker we care about.
+fn detect_phase(line: &str) -> Option<Phase> {
+    let l = line.trim_start();
+    if l.starts_with("[Merger]") {
+        Some(Phase::Merging)
+    } else if l.starts_with("[ExtractAudio]") {
+        Some(Phase::Converting)
+    } else if l.starts_with("[VideoConvertor]")
+        || l.starts_with("[VideoRemuxer]")
+        || l.starts_with("[Fixup")
+        || l.starts_with("[Metadata]")
+        || l.starts_with("[ThumbnailsConvertor]")
+        || l.starts_with("[EmbedThumbnail]")
+    {
+        Some(Phase::Finalizing)
+    } else {
+        None
+    }
+}
+
 /// Spawn yt-dlp, stream progress to `on_progress`, and return the final file path.
 ///
 /// `on_progress` is a *synchronous* callback (it should be cheap and non-blocking,
@@ -88,7 +113,7 @@ pub async fn run_download<F>(
     mut on_progress: F,
 ) -> Result<PathBuf, BotError>
 where
-    F: FnMut(ProgressState) + Send,
+    F: FnMut(ProgressEvent) + Send,
 {
     let args = build_args(url, choice, work_dir);
 
@@ -128,7 +153,9 @@ where
                 match line.map_err(BotError::Io)? {
                     Some(line) => {
                         if let Some(p) = progress::parse_progress_line(&line) {
-                            on_progress(p);
+                            on_progress(ProgressEvent::Update(p));
+                        } else if let Some(phase) = detect_phase(&line) {
+                            on_progress(ProgressEvent::Phase(phase));
                         } else {
                             let t = line.trim();
                             if !t.is_empty() && Path::new(t).is_absolute() {
@@ -222,9 +249,29 @@ mod tests {
     }
 
     #[test]
+    fn progress_is_forced_and_print_is_absent() {
+        // `--print` implies `--quiet`, which suppresses the progress template,
+        // so it must never be present; `--progress` must be.
+        let args = build_args("URL", FormatChoice::BestVideo, Path::new("/tmp/job"));
+        assert!(args.contains(&"--progress".to_string()));
+        assert!(!args.iter().any(|a| a == "--print"));
+        assert!(args.iter().any(|a| a.starts_with("download:PROGRESS:")));
+    }
+
+    #[test]
     fn audio_args_extract_mp3() {
         let args = build_args("URL", FormatChoice::AudioMp3, Path::new("/tmp/job"));
         assert!(args.contains(&"-x".to_string()));
         assert!(args.iter().any(|a| a == "mp3"));
+    }
+
+    #[test]
+    fn detects_postprocess_phases() {
+        assert_eq!(detect_phase("[Merger] Merging formats into \"x.mp4\""), Some(Phase::Merging));
+        assert_eq!(detect_phase("[ExtractAudio] Destination: x.mp3"), Some(Phase::Converting));
+        assert_eq!(detect_phase("[FixupM4a] Correcting container"), Some(Phase::Finalizing));
+        // Plain download/info banners are not stage markers.
+        assert_eq!(detect_phase("[download] Destination: x.mp4"), None);
+        assert_eq!(detect_phase("[youtube] abc: Downloading webpage"), None);
     }
 }
